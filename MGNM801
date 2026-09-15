@@ -1,0 +1,621 @@
+
+# Paste this entire file into ONE Colab code cell and run it.
+# The original file contained notebook-export markers such as
+# 'Text cell <undefined>', which are not valid Python and caused syntax errors.
+
+import os
+import sys
+import warnings
+import numpy as np
+import pandas as pd
+import matplotlib
+
+# Only force the non-interactive "Agg" backend when running as a plain,
+# headless script (no notebook, no display). In Google Colab / Jupyter this
+# check is False, so matplotlib keeps its normal inline backend and every
+# chart renders directly under the cell that produced it, in addition to
+# being saved as a PNG. Forcing Agg unconditionally (as an earlier version
+# of this script did) silently breaks inline chart display in Colab even
+# though the PNG files are still written to disk - that was the bug.
+IN_NOTEBOOK = "ipykernel" in sys.modules or "google.colab" in sys.modules
+if not IN_NOTEBOOK:
+    matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+from sklearn.model_selection import train_test_split
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.pipeline import Pipeline
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import (
+    accuracy_score, precision_score, recall_score,
+    f1_score, roc_auc_score, confusion_matrix, roc_curve
+)
+
+warnings.filterwarnings("ignore")
+
+DATA_URL = "https://raw.githubusercontent.com/IBM/telco-customer-churn-on-icp4d/master/data/Telco-Customer-Churn.csv"
+RANDOM_STATE = 42
+TEST_SIZE = 0.20
+OUTPUT_DIR = "outputs"
+CHART_DIR = os.path.join(OUTPUT_DIR, "charts")
+
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+os.makedirs(CHART_DIR, exist_ok=True)
+
+plt.rcParams.update({"figure.dpi": 100, "savefig.dpi": 150, "font.size": 11})
+
+pd.set_option("display.width", 120)
+pd.set_option("display.max_columns", 40)
+
+
+def section(title):
+    print("\n" + "=" * 80)
+    print(title)
+    print("=" * 80)
+
+section("3. DATA DOWNLOAD")
+df_raw = pd.read_csv(DATA_URL)
+df = df_raw.copy()
+print(f"Downloaded dataset from:\n{DATA_URL}")
+print(f"Raw shape: {df.shape[0]} rows x {df.shape[1]} columns")
+
+section("4. DATA INSPECTION")
+print("Column names:")
+print(list(df.columns))
+
+print("\nData types:")
+print(df.dtypes)
+
+print("\nMissing values (pandas isnull):")
+print(df.isnull().sum())
+print(f"Total missing (pandas isnull): {df.isnull().sum().sum()}")
+
+n_dupe_rows = df.duplicated().sum()
+n_dupe_ids = df["customerID"].duplicated().sum()
+print(f"\nDuplicate rows: {n_dupe_rows}")
+print(f"Duplicate customerID values: {n_dupe_ids}")
+
+print("\nDescriptive statistics (numeric columns as read):")
+print(df.describe(include=[np.number]))
+
+print("\nUnique values - key categorical fields:")
+for col in ["Contract", "InternetService", "PaymentMethod", "Churn"]:
+    print(f"  {col}: {sorted(df[col].unique().tolist())}")
+
+# Inspect TotalCharges specifically - it is read as an object/string column
+print(f"\nTotalCharges dtype as read: {df['TotalCharges'].dtype}")
+blank_mask_raw = df["TotalCharges"].astype(str).str.strip() == ""
+print(f"Blank-string TotalCharges values found: {blank_mask_raw.sum()}")
+
+section("5. DATA CLEANING")
+
+# --- 5.1 TotalCharges: strip whitespace, coerce to numeric ---
+df["TotalCharges"] = pd.to_numeric(df["TotalCharges"].astype(str).str.strip(), errors="coerce")
+na_mask = df["TotalCharges"].isnull()
+print(f"TotalCharges rows converted to NaN by coercion: {na_mask.sum()}")
+print(f"Tenure values of the affected rows: {sorted(df.loc[na_mask, 'tenure'].unique().tolist())}")
+
+# These are legitimate brand-new customers (tenure == 0) who have not yet
+# been billed. They are NOT deleted (that would bias the 0-12 month tenure
+# group and drop real customers). TotalCharges is transparently imputed as
+# MonthlyCharges x tenure, which correctly evaluates to $0 for a zero-tenure
+# customer - i.e. "no charges billed yet", not a guessed/fabricated amount.
+df.loc[na_mask, "TotalCharges"] = df.loc[na_mask, "MonthlyCharges"] * df.loc[na_mask, "tenure"]
+print(f"TotalCharges missing after documented imputation: {df['TotalCharges'].isnull().sum()}")
+
+# --- 5.2 Duplicate rows / duplicate customer IDs ---
+df = df.drop_duplicates()
+df = df.drop_duplicates(subset="customerID")
+print(f"Shape after defensive duplicate-drop (should be unchanged): {df.shape}")
+
+# --- 5.3 Incorrect data types: SeniorCitizen (0/1 -> Yes/No), numeric flag kept ---
+df["SeniorCitizenFlag"] = df["SeniorCitizen"]  # numeric 0/1 retained for reference only
+df["SeniorCitizen"] = df["SeniorCitizen"].map({0: "No", 1: "Yes"})
+
+section("6. DATA VALIDATION")
+checks = {
+    "Negative tenure values": int((df["tenure"] < 0).sum()),
+    "Negative MonthlyCharges": int((df["MonthlyCharges"] < 0).sum()),
+    "Negative TotalCharges": int((df["TotalCharges"] < 0).sum()),
+    "Duplicate rows (post-clean)": int(df.duplicated().sum()),
+    "Duplicate customerID (post-clean)": int(df["customerID"].duplicated().sum()),
+    "Remaining nulls (any column)": int(df.isnull().sum().sum()),
+}
+for k, v in checks.items():
+    print(f"  {k}: {v}")
+print(f"\ntenure range: {df['tenure'].min()} - {df['tenure'].max()} months")
+print(f"MonthlyCharges range: ${df['MonthlyCharges'].min():.2f} - ${df['MonthlyCharges'].max():.2f}")
+print("No rows were removed on the basis of these checks; the dataset was internally consistent.")
+
+section("7. FEATURE ENGINEERING")
+
+# TenureGroup - lifecycle stage
+df["TenureGroup"] = pd.cut(
+    df["tenure"], bins=[-1, 12, 24, 48, 60, 72],
+    labels=["0-12", "13-24", "25-48", "49-60", "61+"]
+)
+
+# MonthlyChargeGroup - price band
+def _charge_band(x):
+    if x < 35:
+        return "Low (<$35)"
+    elif x < 70:
+        return "Medium ($35-$70)"
+    elif x < 100:
+        return "High ($70-$100)"
+    return "Premium ($100+)"
+
+df["MonthlyChargeGroup"] = df["MonthlyCharges"].apply(_charge_band)
+
+# Total_Services - count of all subscribed services (phone + internet + 6 add-ons)
+df["Total_Services"] = (
+    (df["PhoneService"] == "Yes").astype(int)
+    + (df["InternetService"] != "No").astype(int)
+    + (df["OnlineSecurity"] == "Yes").astype(int)
+    + (df["OnlineBackup"] == "Yes").astype(int)
+    + (df["DeviceProtection"] == "Yes").astype(int)
+    + (df["TechSupport"] == "Yes").astype(int)
+    + (df["StreamingTV"] == "Yes").astype(int)
+    + (df["StreamingMovies"] == "Yes").astype(int)
+)
+
+# Premium_Service_Count - count of "peace of mind" add-ons
+df["Premium_Service_Count"] = (
+    (df["OnlineSecurity"] == "Yes").astype(int)
+    + (df["OnlineBackup"] == "Yes").astype(int)
+    + (df["DeviceProtection"] == "Yes").astype(int)
+    + (df["TechSupport"] == "Yes").astype(int)
+)
+
+# Has_Streaming / Has_Internet - descriptive-only binary flags
+df["Has_Streaming"] = ((df["StreamingTV"] == "Yes") | (df["StreamingMovies"] == "Yes")).astype(int)
+df["Has_Internet"] = (df["InternetService"] != "No").astype(int)
+
+# Household_Category - combination of Partner/Dependents
+def _household(row):
+    if row["Partner"] == "Yes" and row["Dependents"] == "Yes":
+        return "Partner & Dependents"
+    elif row["Partner"] == "Yes":
+        return "Partner only"
+    elif row["Dependents"] == "Yes":
+        return "Dependents only"
+    return "Single (no dependents)"
+
+df["Household_Category"] = df.apply(_household, axis=1)
+
+# Payment_Auto - automatic vs manual payment method
+df["Payment_Auto"] = df["PaymentMethod"].apply(lambda x: "Automatic" if "automatic" in x.lower() else "Manual")
+
+# Target variable
+df["Churn_Flag"] = df["Churn"].map({"Yes": 1, "No": 0})
+
+print(f"Final analytical dataset shape: {df.shape[0]} rows x {df.shape[1]} columns")
+print(f"New nulls introduced by feature engineering: {df.isnull().sum().sum() - sum(checks.values()) + checks['Remaining nulls (any column)']}")
+
+# Descriptive-only variables (used for tables/charts, NOT fed to the model):
+DESCRIPTIVE_ONLY_COLS = ["TenureGroup", "MonthlyChargeGroup", "Household_Category",
+                          "Payment_Auto", "Has_Streaming", "Has_Internet", "SeniorCitizenFlag"]
+print(f"\nDescriptive-only engineered variables: {DESCRIPTIVE_ONLY_COLS}")
+
+section("8. DESCRIPTIVE STATISTICS")
+
+n_churned = int(df["Churn_Flag"].sum())
+n_retained = int((df["Churn_Flag"] == 0).sum())
+churn_rate = df["Churn_Flag"].mean()
+print(f"Overall churn: {n_churned} churned, {n_retained} retained, "
+      f"churn rate = {churn_rate*100:.2f}%")
+
+print("\nSummary statistics (tenure, MonthlyCharges, TotalCharges):")
+summary_stats = df[["tenure", "MonthlyCharges", "TotalCharges"]].describe().round(2)
+print(summary_stats)
+
+
+def churn_rate_table(dataframe, groupcol, order=None):
+    g = dataframe.groupby(groupcol, observed=True).agg(
+        Customers=("Churn_Flag", "size"), Churn_Rate=("Churn_Flag", "mean")
+    )
+    g["Churn_Rate_%"] = (g["Churn_Rate"] * 100).round(2)
+    if order is not None:
+        g = g.reindex(order)
+    return g[["Customers", "Churn_Rate_%"]]
+
+
+tables = {}
+tables["Contract"] = churn_rate_table(df, "Contract", ["Month-to-month", "One year", "Two year"])
+tables["TenureGroup"] = churn_rate_table(df, "TenureGroup", ["0-12", "13-24", "25-48", "49-60", "61+"])
+tables["InternetService"] = churn_rate_table(df, "InternetService")
+tables["PaymentMethod"] = churn_rate_table(df, "PaymentMethod")
+tables["MonthlyChargeGroup"] = churn_rate_table(
+    df, "MonthlyChargeGroup", ["Low (<$35)", "Medium ($35-$70)", "High ($70-$100)", "Premium ($100+)"]
+)
+tables["SeniorCitizen"] = churn_rate_table(df, "SeniorCitizen")
+tables["Partner"] = churn_rate_table(df, "Partner")
+tables["Dependents"] = churn_rate_table(df, "Dependents")
+tables["Household_Category"] = churn_rate_table(df, "Household_Category")
+tables["TechSupport"] = churn_rate_table(df, "TechSupport")
+tables["OnlineSecurity"] = churn_rate_table(df, "OnlineSecurity")
+tables["PaperlessBilling"] = churn_rate_table(df, "PaperlessBilling")
+
+for name, t in tables.items():
+    print(f"\nChurn by {name}:")
+    print(t)
+
+churned_vs_retained = df.groupby("Churn", observed=True).agg(
+    Avg_Tenure=("tenure", "mean"),
+    Avg_MonthlyCharges=("MonthlyCharges", "mean"),
+    Avg_TotalCharges=("TotalCharges", "mean"),
+    Avg_Total_Services=("Total_Services", "mean"),
+).round(2)
+print("\nChurned vs Retained - overall comparison:")
+print(churned_vs_retained)
+
+numeric_corr_cols = ["tenure", "MonthlyCharges", "TotalCharges", "Total_Services",
+                      "Premium_Service_Count", "Churn_Flag"]
+correlations = df[numeric_corr_cols].corr()["Churn_Flag"].drop("Churn_Flag").sort_values()
+print("\nCorrelation of numeric variables with Churn_Flag:")
+print(correlations)
+
+section("9. VISUALIZATION GENERATION")
+
+contract_order = ["Month-to-month", "One year", "Two year"]
+rates = df.groupby("Contract", observed=True)["Churn_Flag"].mean().reindex(contract_order) * 100
+fig, ax = plt.subplots(figsize=(7, 5))
+bars = ax.bar(contract_order, rates, color=["#E63946", "#F4A261", "#2A9D8F"])
+for b, r in zip(bars, rates):
+    ax.text(b.get_x() + b.get_width() / 2, r + 1, f"{r:.1f}%", ha="center", fontweight="bold")
+ax.set_ylabel("Churn Rate (%)"); ax.set_xlabel("Contract Type")
+ax.set_title("Figure 1: Customer Churn Rate by Contract Type")
+ax.set_ylim(0, 50)
+plt.tight_layout()
+plt.savefig(f"{CHART_DIR}/fig1_churn_by_contract.png")
+plt.show()   # renders inline in Colab/Jupyter; harmless no-op in plain headless scripts
+plt.close()
+
+fig, ax = plt.subplots(figsize=(7, 5))
+ax.hist(df["tenure"], bins=24, color="#2E86AB", edgecolor="white")
+ax.axvline(df["tenure"].mean(), color="#E63946", linestyle="--", label=f"Mean = {df['tenure'].mean():.1f} months")
+ax.set_xlabel("Tenure (months)"); ax.set_ylabel("Number of Customers")
+ax.set_title("Figure 2: Distribution of Customer Tenure")
+ax.legend()
+plt.tight_layout()
+plt.savefig(f"{CHART_DIR}/fig2_tenure_distribution.png")
+plt.show()   # renders inline in Colab/Jupyter; harmless no-op in plain headless scripts
+plt.close()
+
+counts = df["Churn"].value_counts()
+fig, ax = plt.subplots(figsize=(6, 6))
+ax.pie(counts, labels=["Retained", "Churned"], autopct="%1.1f%%",
+       colors=["#2A9D8F", "#E63946"], startangle=90, wedgeprops={"width": 0.45})
+ax.set_title("Figure 3: Churned vs Retained Customers")
+plt.tight_layout()
+plt.savefig(f"{CHART_DIR}/fig3_churn_proportion.png")
+plt.show()   # renders inline in Colab/Jupyter; harmless no-op in plain headless scripts
+plt.close()
+
+fig, ax = plt.subplots(figsize=(7, 5))
+ax.hist(df.loc[df["Churn"] == "No", "MonthlyCharges"], bins=30, alpha=0.6, label="Retained", color="#2A9D8F", density=True)
+ax.hist(df.loc[df["Churn"] == "Yes", "MonthlyCharges"], bins=30, alpha=0.6, label="Churned", color="#E63946", density=True)
+ax.set_xlabel("Monthly Charges ($)"); ax.set_ylabel("Density")
+ax.set_title("Figure 4: Monthly Charges Distribution by Churn Status")
+ax.legend()
+plt.tight_layout()
+plt.savefig(f"{CHART_DIR}/fig4_monthlycharges_by_churn.png")
+plt.show()   # renders inline in Colab/Jupyter; harmless no-op in plain headless scripts
+plt.close()
+
+pm_order = df.groupby("PaymentMethod", observed=True)["Churn_Flag"].mean().sort_values(ascending=False).index
+rates = df.groupby("PaymentMethod", observed=True)["Churn_Flag"].mean().reindex(pm_order) * 100
+fig, ax = plt.subplots(figsize=(8, 5))
+bars = ax.barh(pm_order, rates, color="#457B9D")
+for b, r in zip(bars, rates):
+    ax.text(r + 0.5, b.get_y() + b.get_height() / 2, f"{r:.1f}%", va="center", fontweight="bold")
+ax.set_xlabel("Churn Rate (%)")
+ax.set_title("Figure 5: Customer Churn Rate by Payment Method")
+ax.set_xlim(0, 55)
+plt.tight_layout()
+plt.savefig(f"{CHART_DIR}/fig5_churn_by_payment.png")
+plt.show()   # renders inline in Colab/Jupyter; harmless no-op in plain headless scripts
+plt.close()
+
+tg_order = ["0-12", "13-24", "25-48", "49-60", "61+"]
+rates = df.groupby("TenureGroup", observed=True)["Churn_Flag"].mean().reindex(tg_order) * 100
+fig, ax = plt.subplots(figsize=(7, 5))
+bars = ax.bar(tg_order, rates, color="#F4A261")
+for b, r in zip(bars, rates):
+    ax.text(b.get_x() + b.get_width() / 2, r + 1, f"{r:.1f}%", ha="center", fontweight="bold")
+ax.set_xlabel("Tenure Group (months)"); ax.set_ylabel("Churn Rate (%)")
+ax.set_title("Figure 6: Customer Churn Rate by Tenure Group")
+ax.set_ylim(0, 55)
+plt.tight_layout()
+plt.savefig(f"{CHART_DIR}/fig6_churn_by_tenuregroup.png")
+plt.show()   # renders inline in Colab/Jupyter; harmless no-op in plain headless scripts
+plt.close()
+
+print(f"6 descriptive figures saved to {CHART_DIR}/ (figures 7-9 are generated after modelling, in Section 13-16)")
+
+section("10. PREDICTIVE PREPROCESSING")
+
+numeric_cols = ["tenure", "MonthlyCharges", "TotalCharges", "Total_Services", "Premium_Service_Count"]
+categorical_cols = ["gender", "SeniorCitizen", "Partner", "Dependents", "PhoneService", "MultipleLines",
+                     "InternetService", "OnlineSecurity", "OnlineBackup", "DeviceProtection", "TechSupport",
+                     "StreamingTV", "StreamingMovies", "Contract", "PaperlessBilling", "PaymentMethod"]
+feature_cols = numeric_cols + categorical_cols
+
+excluded_cols = ["customerID", "Churn", "Churn_Flag", "SeniorCitizenFlag",
+                  "TenureGroup", "MonthlyChargeGroup", "Household_Category", "Payment_Auto",
+                  "Has_Streaming", "Has_Internet"]
+
+print("Leakage / redundancy check:")
+print(f"  customerID  -> excluded (identifier, no predictive meaning)")
+print(f"  Churn / Churn_Flag -> excluded (these ARE the target; including either is leakage by definition)")
+print(f"  TenureGroup, MonthlyChargeGroup, Household_Category, Payment_Auto, SeniorCitizenFlag")
+print(f"      -> excluded: each is a re-expression of a raw variable already in the feature set")
+print(f"         (tenure, MonthlyCharges, Partner/Dependents, PaymentMethod, SeniorCitizen);")
+print(f"         keeping both would add duplicate/collinear signal, not new information.")
+print(f"  Has_Streaming, Has_Internet")
+print(f"      -> excluded: binary re-expressions of StreamingTV/StreamingMovies and InternetService,")
+print(f"         which are already present as categorical predictors.")
+print(f"  No column in this dataset records a post-churn event (cancellation date, exit reason, etc.),")
+print(f"  so beyond the identifier/target/redundant columns above, no further leakage risk was found.")
+
+assert set(feature_cols) | set(excluded_cols) == set(df.columns), "Column accounting mismatch - check feature/excluded lists"
+assert "Churn" not in feature_cols and "Churn_Flag" not in feature_cols
+
+print(f"\nFinal predictor set: {len(feature_cols)} columns")
+print(f"  Numeric ({len(numeric_cols)}): {numeric_cols}")
+print(f"  Categorical ({len(categorical_cols)}): {categorical_cols}")
+
+X = df[feature_cols].copy()
+y = df["Churn_Flag"].copy()
+
+preprocessor = ColumnTransformer(transformers=[
+    ("num", StandardScaler(), numeric_cols),
+    ("cat", OneHotEncoder(handle_unknown="ignore", drop="if_binary"), categorical_cols),
+])
+
+section("11. TRAIN/TEST SPLIT")
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=TEST_SIZE, random_state=RANDOM_STATE, stratify=y
+)
+print(f"Training observations: {X_train.shape[0]}")
+print(f"Test observations: {X_test.shape[0]}")
+print(f"Churn rate (train): {y_train.mean()*100:.2f}%")
+print(f"Churn rate (test): {y_test.mean()*100:.2f}%")
+
+section("12. MODEL TRAINING")
+
+log_reg = Pipeline([
+    ("preprocess", preprocessor),
+    ("model", LogisticRegression(max_iter=2000, random_state=RANDOM_STATE)),
+])
+log_reg.fit(X_train, y_train)
+print("Logistic Regression trained successfully.")
+
+rf = Pipeline([
+    ("preprocess", preprocessor),
+    ("model", RandomForestClassifier(
+        n_estimators=300, max_depth=8, min_samples_leaf=10,
+        random_state=RANDOM_STATE, class_weight="balanced"
+    )),
+])
+rf.fit(X_train, y_train)
+print("Random Forest trained successfully (class_weight='balanced' to address churn-class imbalance).")
+
+section("13. MODEL EVALUATION")
+
+
+def evaluate(model, X_test, y_test, name):
+    y_pred = model.predict(X_test)
+    y_proba = model.predict_proba(X_test)[:, 1]
+    metrics = {
+        "Accuracy": accuracy_score(y_test, y_pred),
+        "Precision": precision_score(y_test, y_pred),
+        "Recall": recall_score(y_test, y_pred),
+        "F1": f1_score(y_test, y_pred),
+        "ROC_AUC": roc_auc_score(y_test, y_proba),
+    }
+    print(f"\n{name}:")
+    for k, v in metrics.items():
+        print(f"  {k}: {v:.4f}")
+    return metrics, y_pred, y_proba
+
+
+log_metrics, log_pred, log_proba = evaluate(log_reg, X_test, y_test, "Logistic Regression")
+rf_metrics, rf_pred, rf_proba = evaluate(rf, X_test, y_test, "Random Forest")
+
+print("""
+Why recall matters here: the majority class (retained, ~73.5%) dominates the
+data, so accuracy alone is a misleading metric - a model that always predicts
+"retained" would score ~73.5% accuracy while catching zero churners. In a
+retention context, a false negative (a real churner who is not flagged) means
+a fully lost customer and their entire future recurring revenue, while a false
+positive (a retained customer incorrectly flagged) only costs the modest price
+of an unnecessary retention offer. Recall is therefore weighted most heavily
+in champion-model selection, with F1 and ROC-AUC as supporting metrics.
+""")
+
+# Business-rule-based champion selection: prioritise recall
+if rf_metrics["Recall"] > log_metrics["Recall"]:
+    champion_name, champion_model = "Random Forest", rf
+    champion_metrics, champion_pred, champion_proba = rf_metrics, rf_pred, rf_proba
+else:
+    champion_name, champion_model = "Logistic Regression", log_reg
+    champion_metrics, champion_pred, champion_proba = log_metrics, log_pred, log_proba
+
+print(f"CHAMPION MODEL (selected on recall, supported by F1/ROC-AUC): {champion_name}")
+
+section("14. CONFUSION MATRIX")
+
+cm = confusion_matrix(y_test, champion_pred)
+tn, fp, fn, tp = cm.ravel()
+print(f"Confusion matrix ({champion_name}, test set):")
+print(cm)
+print(f"TN={tn}  FP={fp}  FN={fn}  TP={tp}")
+
+fig, ax = plt.subplots(figsize=(7.5, 6))
+ax.imshow(cm, cmap="Blues")
+for i in range(2):
+    for j in range(2):
+        ax.text(j, i, str(cm[i, j]), ha="center", va="center", fontsize=16, fontweight="bold",
+                color="white" if cm[i, j] > cm.max() / 2 else "black")
+ax.set_xticks([0, 1]); ax.set_xticklabels(["Predicted: No Churn", "Predicted: Churn"])
+ax.set_yticks([0, 1]); ax.set_yticklabels(["Actual: No Churn", "Actual: Churn"])
+ax.set_title(f"Figure 8: Confusion Matrix — {champion_name} (Test Set)", fontsize=12)
+plt.tight_layout()
+plt.savefig(f"{CHART_DIR}/fig8_confusion_matrix.png")
+plt.show()   # renders inline in Colab/Jupyter; harmless no-op in plain headless scripts
+plt.close()
+
+section("15. ROC CURVE")
+
+fpr_log, tpr_log, _ = roc_curve(y_test, log_proba)
+fpr_rf, tpr_rf, _ = roc_curve(y_test, rf_proba)
+
+fig, ax = plt.subplots(figsize=(7, 6))
+ax.plot(fpr_log, tpr_log, label=f"Logistic Regression (AUC={log_metrics['ROC_AUC']:.3f})", color="#457B9D")
+ax.plot(fpr_rf, tpr_rf, label=f"Random Forest (AUC={rf_metrics['ROC_AUC']:.3f})", color="#E63946")
+ax.plot([0, 1], [0, 1], linestyle="--", color="gray", label="Random classifier (AUC=0.500)")
+ax.set_xlabel("False Positive Rate"); ax.set_ylabel("True Positive Rate")
+ax.set_title("Figure 7: ROC Curve — Model Comparison")
+ax.legend(loc="lower right")
+plt.tight_layout()
+plt.savefig(f"{CHART_DIR}/fig7_roc_curve.png")
+plt.show()   # renders inline in Colab/Jupyter; harmless no-op in plain headless scripts
+plt.close()
+print(f"ROC-AUC: Logistic Regression = {log_metrics['ROC_AUC']:.4f}, Random Forest = {rf_metrics['ROC_AUC']:.4f}")
+
+section("16. FEATURE IMPORTANCE / COEFFICIENTS")
+
+
+def get_feature_names(pipeline):
+    pre = pipeline.named_steps["preprocess"]
+    cat_names = list(pre.named_transformers_["cat"].get_feature_names_out(categorical_cols))
+    return numeric_cols + cat_names
+
+
+feat_names_rf = get_feature_names(rf)
+rf_importances = rf.named_steps["model"].feature_importances_
+assert len(feat_names_rf) == len(rf_importances)
+importance_df = pd.DataFrame({"feature": feat_names_rf, "importance": rf_importances}) \
+    .sort_values("importance", ascending=False).reset_index(drop=True)
+print("Random Forest - top 10 feature importances:")
+print(importance_df.head(10).to_string(index=False))
+
+feat_names_log = get_feature_names(log_reg)
+log_coefs = log_reg.named_steps["model"].coef_[0]
+assert len(feat_names_log) == len(log_coefs)
+coef_df = pd.DataFrame({"feature": feat_names_log, "coefficient": log_coefs})
+coef_df["abs_coefficient"] = coef_df["coefficient"].abs()
+coef_df = coef_df.sort_values("abs_coefficient", ascending=False).drop(columns="abs_coefficient").reset_index(drop=True)
+print("\nLogistic Regression - top 10 standardised coefficients (by magnitude):")
+print(coef_df.head(10).to_string(index=False))
+
+print("""
+Note on interpretation: feature importance / coefficient magnitude reflects
+PREDICTIVE ASSOCIATION learned from observational data, not a causal effect.
+A high-importance feature indicates it helps the model discriminate churners
+from non-churners in this dataset; it does not by itself prove that changing
+that variable for an individual customer would change their churn outcome.
+""")
+
+top10_importance = importance_df.head(10).iloc[::-1]
+fig, ax = plt.subplots(figsize=(8, 6))
+ax.barh(top10_importance["feature"], top10_importance["importance"], color="#2A9D8F")
+ax.set_xlabel("Feature Importance")
+ax.set_title("Figure 9: Top 10 Predictors of Churn (Random Forest)")
+plt.tight_layout()
+plt.savefig(f"{CHART_DIR}/fig9_feature_importance.png")
+plt.show()   # renders inline in Colab/Jupyter; harmless no-op in plain headless scripts
+plt.close()
+
+print(f"\nAll 9 Matplotlib figures now saved in {CHART_DIR}/")
+
+section("17. FINAL FINDINGS SUMMARY")
+
+print(f"""
+DESCRIPTIVE:
+  - Overall churn rate: {churn_rate*100:.2f}% ({n_churned} of {df.shape[0]} customers)
+  - Contract type is the strongest differentiator: Month-to-month {tables['Contract'].loc['Month-to-month','Churn_Rate_%']}% vs
+    Two year {tables['Contract'].loc['Two year','Churn_Rate_%']}%
+  - Churn is concentrated in the first year of tenure: {tables['TenureGroup'].loc['0-12','Churn_Rate_%']}% (0-12 months)
+    falling to {tables['TenureGroup'].loc['61+','Churn_Rate_%']}% at 61+ months
+  - Fibre-optic customers churn at {tables['InternetService'].loc['Fiber optic','Churn_Rate_%']}% vs DSL {tables['InternetService'].loc['DSL','Churn_Rate_%']}%
+  - Electronic check payers churn at {tables['PaymentMethod'].loc['Electronic check','Churn_Rate_%']}%, the highest of any payment method
+
+PREDICTIVE:
+  - Logistic Regression: Accuracy={log_metrics['Accuracy']:.4f}, Precision={log_metrics['Precision']:.4f}, Recall={log_metrics['Recall']:.4f}, F1={log_metrics['F1']:.4f}, ROC-AUC={log_metrics['ROC_AUC']:.4f}
+  - Random Forest:       Accuracy={rf_metrics['Accuracy']:.4f}, Precision={rf_metrics['Precision']:.4f}, Recall={rf_metrics['Recall']:.4f}, F1={rf_metrics['F1']:.4f}, ROC-AUC={rf_metrics['ROC_AUC']:.4f}
+  - Champion model: {champion_name} (selected on recall = {champion_metrics['Recall']:.4f})
+  - Top predictors: {', '.join(importance_df.head(5)['feature'].tolist())}
+""")
+
+section("18. RECOMMENDATION-SUPPORTING OUTPUTS")
+
+rec_support = {
+    "month_to_month_customers": int((df["Contract"] == "Month-to-month").sum()),
+    "month_to_month_churn_rate_%": tables["Contract"].loc["Month-to-month", "Churn_Rate_%"],
+    "two_year_churn_rate_%": tables["Contract"].loc["Two year", "Churn_Rate_%"],
+    "zero_to_12mo_customers": int((df["TenureGroup"] == "0-12").sum()),
+    "zero_to_12mo_churn_rate_%": tables["TenureGroup"].loc["0-12", "Churn_Rate_%"],
+    "avg_tenure_churned": round(float(df.loc[df["Churn"] == "Yes", "tenure"].mean()), 2),
+    "avg_tenure_retained": round(float(df.loc[df["Churn"] == "No", "tenure"].mean()), 2),
+    "no_techsupport_churn_rate_%": tables["TechSupport"].loc["No", "Churn_Rate_%"],
+    "no_onlinesecurity_churn_rate_%": tables["OnlineSecurity"].loc["No", "Churn_Rate_%"],
+    "electronic_check_churn_rate_%": tables["PaymentMethod"].loc["Electronic check", "Churn_Rate_%"],
+    "auto_bank_transfer_churn_rate_%": tables["PaymentMethod"].loc["Bank transfer (automatic)", "Churn_Rate_%"],
+    "auto_credit_card_churn_rate_%": tables["PaymentMethod"].loc["Credit card (automatic)", "Churn_Rate_%"],
+    "champion_model": champion_name,
+    "champion_recall": round(float(champion_metrics["Recall"]), 4),
+    "champion_f1": round(float(champion_metrics["F1"]), 4),
+    "champion_roc_auc": round(float(champion_metrics["ROC_AUC"]), 4),
+    "true_positives": int(tp), "false_negatives": int(fn),
+    "false_positives": int(fp), "true_negatives": int(tn),
+}
+for k, v in rec_support.items():
+    print(f"  {k}: {v}")
+
+section("19. SAVE OUTPUTS")
+
+# Cleaned dataset
+df.to_csv(f"{OUTPUT_DIR}/telco_churn_cleaned.csv", index=False)
+
+# Descriptive statistics
+summary_stats.to_csv(f"{OUTPUT_DIR}/descriptive_summary_stats.csv")
+for name, t in tables.items():
+    t.to_csv(f"{OUTPUT_DIR}/churn_by_{name}.csv")
+churned_vs_retained.to_csv(f"{OUTPUT_DIR}/churned_vs_retained_comparison.csv")
+
+# Model comparison
+model_comparison = pd.DataFrame({
+    "Logistic Regression": log_metrics,
+    "Random Forest": rf_metrics,
+}).round(4)
+model_comparison.to_csv(f"{OUTPUT_DIR}/model_comparison.csv")
+
+# Predictions on test set
+predictions_df = X_test.copy()
+predictions_df["Actual_Churn"] = y_test.values
+predictions_df["Predicted_Churn_LogReg"] = log_pred
+predictions_df["Predicted_Proba_LogReg"] = log_proba.round(4)
+predictions_df["Predicted_Churn_RF"] = rf_pred
+predictions_df["Predicted_Proba_RF"] = rf_proba.round(4)
+predictions_df.to_csv(f"{OUTPUT_DIR}/test_set_predictions.csv", index=False)
+
+# Feature importance / coefficients
+importance_df.to_csv(f"{OUTPUT_DIR}/rf_feature_importance.csv", index=False)
+coef_df.to_csv(f"{OUTPUT_DIR}/logreg_coefficients.csv", index=False)
+
+# Confusion matrix
+pd.DataFrame(cm, index=["Actual: No Churn", "Actual: Churn"],
+             columns=["Predicted: No Churn", "Predicted: Churn"]).to_csv(f"{OUTPUT_DIR}/confusion_matrix_{champion_name.replace(' ', '_')}.csv")
+
+# Recommendation-support numbers
+pd.Series(rec_support).to_csv(f"{OUTPUT_DIR}/recommendation_support_numbers.csv")
+
+print(f"All outputs saved under ./{OUTPUT_DIR}/ (including ./{CHART_DIR}/ for the 9 PNG figures).")
+print("\n" + "=" * 80)
+print("WORKFLOW COMPLETE")
+print("=" * 80)

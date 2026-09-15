@@ -1,8 +1,4 @@
 
-# Paste this entire file into ONE Colab code cell and run it.
-# The original file contained notebook-export markers such as
-# 'Text cell <undefined>', which are not valid Python and caused syntax errors.
-
 import os
 import sys
 import warnings
